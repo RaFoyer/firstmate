@@ -10,6 +10,7 @@
 #                 "CREW_DISPATCH: active config/crew-dispatch.json" plus indented rules,
 #                 "FLEET_SYNC: <repo>: skipped|recovered|STUCK: <detail>",
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
+#                 "BROWSER_HOOKS: chrome-devtools-axi ambient hooks detected ...",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: <window-targets...>",
 #                 "FMX: X mode on ..." or "FMX: X mode off ...".
@@ -54,6 +55,11 @@
 #          before - this flag is purely additive.
 #        fm-bootstrap.sh install <tool>...
 #          Install the named tools (only ones the captain approved).
+#          gh-axi and lavish-axi install their session hooks; chrome-devtools-axi
+#          stays hook-free because it is a browser fallback, not an ambient preference.
+#        fm-bootstrap.sh migrate-browser-hooks
+#          After captain approval, remove chrome-devtools-axi-owned ambient hooks
+#          from supported agent configs while preserving every unrelated entry.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,8 +68,11 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 CONFIG="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
+BROWSER_HOOK_HOME="${FM_BROWSER_HOOK_HOME_OVERRIDE:-${HOME:-}}"
 # shellcheck source=bin/fm-tasks-axi-lib.sh
 . "$SCRIPT_DIR/fm-tasks-axi-lib.sh"
+# shellcheck source=bin/fm-axi-lib.sh
+. "$SCRIPT_DIR/fm-axi-lib.sh"
 # shellcheck source=bin/fm-tangle-lib.sh
 . "$SCRIPT_DIR/fm-tangle-lib.sh"
 # shellcheck source=bin/fm-ff-lib.sh
@@ -181,10 +190,108 @@ install_cmd() {
     codex) echo "brew install codex  # or install the Codex CLI from OpenAI" ;;
     treehouse) echo "curl -fsSL https://kunchenguid.github.io/treehouse/install.sh | sh" ;;
     no-mistakes) echo "curl -fsSL https://raw.githubusercontent.com/kunchenguid/no-mistakes/main/docs/install.sh | sh" ;;
-    gh-axi|chrome-devtools-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
+    gh-axi|lavish-axi) echo "npm install -g $1 && $1 setup hooks" ;;
+    chrome-devtools-axi) echo "npm install -g $1" ;;
     tasks-axi) echo "npm install -g tasks-axi" ;;
     *) return 1 ;;
   esac
+}
+
+browser_hook_json_has_managed() {
+  local file=$1
+  [ -f "$file" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  jq -e '
+    def managed:
+      (.command? | type) == "string"
+      and (.command | contains("chrome-devtools-axi"));
+    any((.hooks.session_start? // [])[]?; managed)
+    or any((.hooks.SessionStart? // [])[]?.hooks[]?; managed)
+  ' "$file" >/dev/null 2>&1
+}
+
+browser_hook_plugin_has_managed() {
+  local file=$1
+  [ -f "$file" ] || return 1
+  grep -Fq 'axi-sdk-js managed opencode plugin: chrome-devtools-axi' "$file" 2>/dev/null
+}
+
+browser_hooks_detected() {
+  [ -n "$BROWSER_HOOK_HOME" ] || return 1
+  browser_hook_json_has_managed "$BROWSER_HOOK_HOME/.claude/settings.json" && return 0
+  browser_hook_json_has_managed "$BROWSER_HOOK_HOME/.codex/hooks.json" && return 0
+  browser_hook_plugin_has_managed "$BROWSER_HOOK_HOME/.config/opencode/plugins/axi-chrome-devtools-axi.js"
+}
+
+browser_hook_config_target() {
+  local path=$1 link dir hops
+  hops=0
+  while [ -L "$path" ]; do
+    hops=$((hops + 1))
+    [ "$hops" -le 40 ] || return 1
+    dir=$(cd -P "$(dirname "$path")" && pwd) || return 1
+    link=$(readlink "$path") || return 1
+    case "$link" in
+      /*) path=$link ;;
+      *) path="$dir/$link" ;;
+    esac
+  done
+  printf '%s\n' "$path"
+}
+
+retire_browser_hook_json() {
+  local file=$1 target tmp mode
+  browser_hook_json_has_managed "$file" || return 0
+  target=$(browser_hook_config_target "$file") || return 1
+  tmp=$(mktemp "${target}.fm-browser-hooks.XXXXXX") || return 1
+  if ! jq '
+    def managed:
+      (.command? | type) == "string"
+      and (.command | contains("chrome-devtools-axi"));
+    if (.hooks? | type) != "object" then .
+    else
+      (if (.hooks.session_start? | type) == "array" then
+         (.hooks.session_start | any(managed)) as $had_managed
+         | if $had_managed then
+             .hooks.session_start |= map(select(managed | not))
+             | if (.hooks.session_start | length) == 0 then del(.hooks.session_start) else . end
+           else . end
+       else . end)
+      | (if (.hooks.SessionStart? | type) == "array" then
+           (.hooks.SessionStart | any(.[] | .hooks[]?; managed)) as $had_managed
+           | if $had_managed then
+               .hooks.SessionStart |= map(
+                 if (.hooks? | type) == "array" and any(.hooks[]?; managed) then
+                   .hooks |= map(select(managed | not))
+                   | if (.hooks | length) == 0 then empty else . end
+                 else . end
+               )
+               | if (.hooks.SessionStart | length) == 0 then del(.hooks.SessionStart) else . end
+             else . end
+         else . end)
+    end
+  ' "$target" > "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mode=$(stat -c '%a' "$target" 2>/dev/null || stat -f '%Lp' "$target" 2>/dev/null || true)
+  [ -z "$mode" ] || chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$target"
+}
+
+retire_browser_hooks() {
+  local plugin failed
+  [ -n "$BROWSER_HOOK_HOME" ] || { echo "error: HOME is unavailable" >&2; return 1; }
+  command -v jq >/dev/null 2>&1 || { echo "error: jq is required to migrate browser hooks" >&2; return 1; }
+  failed=0
+  retire_browser_hook_json "$BROWSER_HOOK_HOME/.claude/settings.json" || failed=1
+  retire_browser_hook_json "$BROWSER_HOOK_HOME/.codex/hooks.json" || failed=1
+  plugin="$BROWSER_HOOK_HOME/.config/opencode/plugins/axi-chrome-devtools-axi.js"
+  if browser_hook_plugin_has_managed "$plugin"; then
+    rm -f "$plugin" || failed=1
+  fi
+  [ "$failed" -eq 0 ] || { echo "error: failed to retire one or more browser hooks" >&2; return 1; }
+  echo "BROWSER_HOOKS: chrome-devtools-axi ambient hooks retired"
 }
 
 BACKEND=$(fm_backend_name)
@@ -430,6 +537,12 @@ if [ "${1:-}" = "install" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "migrate-browser-hooks" ]; then
+  [ "$#" -eq 1 ] || { echo "usage: fm-bootstrap.sh migrate-browser-hooks" >&2; exit 1; }
+  retire_browser_hooks
+  exit $?
+fi
+
 for t in $TOOLS; do
   command -v "$t" >/dev/null || echo "MISSING: $t (install: $(install_cmd "$t"))"
 done
@@ -441,6 +554,9 @@ if tool_required treehouse && command -v treehouse >/dev/null 2>&1 && ! treehous
 fi
 if command -v no-mistakes >/dev/null 2>&1 && ! no_mistakes_compatible; then
   echo "MISSING: no-mistakes (install: $(install_cmd no-mistakes))"
+fi
+if command -v chrome-devtools-axi >/dev/null 2>&1 && ! fm_axi_isolated_sessions_supported; then
+  echo "MISSING: chrome-devtools-axi (install: $(install_cmd chrome-devtools-axi))"
 fi
 gh auth status >/dev/null 2>&1 || echo "NEEDS_GH_AUTH"
 # Worktree-tangle check: the firstmate primary checkout (FM_ROOT) must sit on its
@@ -460,6 +576,9 @@ crew=
 [ -n "$crew" ] && [ "$crew" != "default" ] && echo "CREW_HARNESS_OVERRIDE: $crew"
 project_registry_validate
 crew_dispatch_validate
+if browser_hooks_detected; then
+  echo "BROWSER_HOOKS: chrome-devtools-axi ambient hooks detected; after captain approval run: bin/fm-bootstrap.sh migrate-browser-hooks"
+fi
 if ! fm_backlog_backend_manual "$CONFIG"; then
   if fm_tasks_axi_compatible; then
     echo "TASKS_AXI: available"
